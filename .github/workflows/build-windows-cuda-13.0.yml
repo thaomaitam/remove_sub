@@ -1,0 +1,94 @@
+name: Build Windows CUDA 13.0
+
+on:
+  push:
+    branches:
+      - '**' # Kích hoạt khi có push trên bất kỳ nhánh nào
+  workflow_dispatch: # Cho phép kích hoạt thủ công
+    inputs:
+      ssh:
+        description: 'Kết nối SSH tới Actions'
+        required: false
+        default: false
+
+permissions:
+  contents: write # Cấp quyền ghi nội dung kho lưu trữ
+
+jobs:
+  build:
+    runs-on: windows-latest # Chạy trên hệ điều hành Windows mới nhất
+    steps:
+    - uses: actions/checkout@v4 # Sử dụng action để checkout mã nguồn
+    - name: Đọc VERSION
+      id: version
+      run: |
+        VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' backend/config.py)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+      shell: bash # Sử dụng bash shell
+    # - name: Kiểm tra xem tag đã tồn tại chưa
+    #   run: |
+    #     TAG_NAME="${VERSION}"
+    #     if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
+    #       echo "Tag $TAG_NAME đã tồn tại, ngừng phát hành"
+    #       exit 1
+    #     fi
+    #   shell: bash
+    - uses: actions/setup-python@v5 # Sử dụng action để thiết lập Python
+      with:
+        python-version: '3.12'
+        cache: 'pip' # Lưu trữ bộ nhớ đệm cho các phụ thuộc pip
+    - run: pip install paddlepaddle==3.0.0
+    - run: pip install -r requirements.txt
+    - run: pip freeze > requirements.txt
+    - run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+    - run: pip install QPT==1.0b8 setuptools
+    - name: Lấy đường dẫn site-packages
+      shell: bash
+      run: |
+        SITE_PACKAGES=$(python -c "import site, os; print(os.path.join(site.getsitepackages()[0], 'Lib', 'site-packages'))")
+        SITE_PACKAGES_UNIX=$(cygpath -u "$SITE_PACKAGES")
+        echo "Đường dẫn site-packages: $SITE_PACKAGES"
+        echo "Đường dẫn site-packages UNIX: $SITE_PACKAGES_UNIX"
+        echo "SITE_PACKAGES_UNIX=$SITE_PACKAGES_UNIX" >> $GITHUB_ENV
+        echo "SITE_PACKAGES=$SITE_PACKAGES" >> $GITHUB_ENV
+    - name: Sửa lỗi nội bộ QPT
+      run: sed -i '98c\        try:\n            dep = pkg.requires()\n        except TypeError:\n            continue' ${SITE_PACKAGES_UNIX}/qpt/kernel/qpackage.py
+      shell: bash
+    - name: Bắt đầu SSH qua tmate
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      uses: mxschmitt/action-tmate@v3
+    - run: |
+        python backend/tools/makedist.py --cuda 13.0 && \
+        mv ../vsr_out ./vsr_out && \
+        cp ./vsr_out/Debug/Debug-进入虚拟环境.cmd ./vsr_out/Release/
+      env:
+        QPT_Action: "True"
+      shell: bash
+    - name: Tải thư mục Debug lên Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0-debug
+        path: vsr_out/Debug/
+    - name: Tải thư mục Release lên Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0-release
+        path: vsr_out/Release/
+    - name: Nén thư mục Release
+      run: |
+        cd vsr_out/Release
+        7z a -t7z -mx=9 -m0=LZMA2 -ms=on -mfb=64 -md=32m -mmt=on -v2000m vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z * && \
+        # Phát hiện xem chỉ có một tập tin nén hay không
+        if [ -f vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z.001 ] && [ ! -f vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z.002 ]; then \
+          mv vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z.001 vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z; fi
+      shell: bash
+    - name: Phát hành (Release)
+      uses: softprops/action-gh-release@v1
+      with:
+        prerelease: true # Đánh dấu là bản phát hành trước (prerelease)
+        tag_name: ${{ env.VERSION }}
+        target_commitish: ${{ github.sha }}
+        name: Remove-sub v${{ env.VERSION }}
+        files: |
+          vsr_out/Release/vsr-v${{ env.VERSION }}-windows-nvidia-cuda-13.0.7z*
